@@ -53,15 +53,15 @@ module Dependabot
 
           file = files.find { |f| f.name == new_req.fetch(:file) }
 
-          files = update_declaration(files, dependency, file)
+          files = update_declaration(files, dependency, file, old_req, new_req)
         end
 
         files
       end
 
-      def update_declaration(files, dependency, file)
+      def update_declaration(files, dependency, file, old_req, new_req)
         files = files.dup
-        updated_content = updated_cake_file_content(dependency, file)
+        updated_content = updated_cake_file_content(dependency, file, old_req, new_req)
 
         raise "Expected content to change!" if updated_content == file.content
 
@@ -70,7 +70,7 @@ module Dependabot
         files
       end
 
-      def updated_cake_file_content(dependency, file)
+      def updated_cake_file_content(dependency, file, old_req, new_req)
         updated_content = file.content
 
         file.content.each_line do |line|
@@ -78,9 +78,10 @@ module Dependabot
           next if directive.nil?
           next unless supported_scheme?(directive.scheme)
           next unless directive.query[:package] == dependency.name
+          next unless directive.query[:version] == old_req.fetch(:requirement)
 
-          new_declaration = line.gsub("version=#{dependency.previous_version}",
-                                      "version=#{dependency.version}")
+          new_declaration = line.gsub("version=#{old_req.fetch(:requirement)}",
+                                      "version=#{new_req.fetch(:requirement)}")
 
           updated_content = updated_content.gsub(line, new_declaration)
         end
