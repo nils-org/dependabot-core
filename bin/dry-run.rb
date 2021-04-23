@@ -95,7 +95,7 @@ require "dependabot/terraform"
 $options = {
   credentials: [],
   directory: "/",
-  dependency_name: nil,
+  dependency_names: nil,
   branch: nil,
   cache_steps: [],
   write: false,
@@ -104,6 +104,8 @@ $options = {
   requirements_update_strategy: nil,
   commit: nil,
   updater_options: {},
+  security_advisories: [],
+  security_updates_only: false
 }
 
 unless ENV["LOCAL_GITHUB_ACCESS_TOKEN"].to_s.strip.empty?
@@ -122,6 +124,15 @@ unless ENV["LOCAL_CONFIG_VARIABLES"].to_s.strip.empty?
   $options[:credentials].concat(JSON.parse(ENV["LOCAL_CONFIG_VARIABLES"]))
 end
 
+unless ENV["SECURITY_ADVISORIES"].to_s.strip.empty?
+  # For example:
+  # [{"dependency_name":"name",
+  #   "patched_versions":[],
+  #   "unaffected_versions":[],
+  #   "affected_versions":["< 0.10.0"]}]
+  $options[:security_advisories].concat(JSON.parse(ENV["SECURITY_ADVISORIES"]))
+end
+
 option_parse = OptionParser.new do |opts|
   opts.banner = "usage: ruby bin/dry-run.rb [OPTIONS] PACKAGE_MANAGER REPO"
 
@@ -133,8 +144,9 @@ option_parse = OptionParser.new do |opts|
     $options[:branch] = value
   end
 
-  opts.on("--dep DEPENDENCY", "Dependency to update") do |value|
-    $options[:dependency_name] = value
+  opts.on("--dep DEPENDENCIES",
+          "Comma separated list of dependencies to update") do |value|
+    $options[:dependency_names] = value.split(",").map { |o| o.strip.downcase }
   end
 
   opts.on("--cache STEPS", "Cache e.g. files, dependencies") do |value|
@@ -172,6 +184,11 @@ option_parse = OptionParser.new do |opts|
                                      [o.strip.downcase.to_sym, true]
                                    end
                                  ]
+  end
+
+  opts.on("--security-updates-only",
+          "Only update vulnerable dependencies") do |_value|
+    $options[:security_updates_only] = true
   end
 end
 
@@ -254,7 +271,8 @@ def cached_dependency_files_read
   end
 
   if all_files_cached && $options[:cache_steps].include?("files")
-    puts "=> reading dependency files from cache: ./#{cache_dir}"
+    puts "=> reading dependency files from cache manifest: "\
+         "./#{cache_manifest_path}"
     cached_dependency_files.map do |file|
       file_content = File.read(File.join(cache_dir, file["name"]))
       Dependabot::DependencyFile.new(
@@ -307,6 +325,96 @@ end
 # rubocop:enable Metrics/MethodLength
 # rubocop:enable Metrics/AbcSize
 
+def handle_dependabot_error(error:, dependency:)
+  error_details =
+    case error
+    when Dependabot::DependencyFileNotResolvable
+      {
+        "error-type": "dependency_file_not_resolvable",
+        "error-detail": { message: error.message },
+      }
+    when Dependabot::DependencyFileNotEvaluatable
+      {
+        "error-type": "dependency_file_not_evaluatable",
+        "error-detail": { message: error.message },
+      }
+    when Dependabot::BranchNotFound
+      {
+        "error-type": "branch_not_found",
+        "error-detail": { "branch-name": error.branch_name },
+      }
+    when Dependabot::DependencyFileNotParseable
+      {
+        "error-type": "dependency_file_not_parseable",
+        "error-detail": {
+          message: error.message,
+          "file-path": error.file_path,
+        },
+      }
+    when Dependabot::DependencyFileNotFound
+      {
+        "error-type": "dependency_file_not_found",
+        "error-detail": { "file-path": error.file_path },
+      }
+    when Dependabot::PathDependenciesNotReachable
+      {
+        "error-type": "path_dependencies_not_reachable",
+        "error-detail": { dependencies: error.dependencies },
+      }
+    when Dependabot::PrivateSourceAuthenticationFailure
+      {
+        "error-type": "private_source_authentication_failure",
+        "error-detail": { source: error.source },
+      }
+    when Dependabot::GitDependenciesNotReachable
+      {
+        "error-type": "git_dependencies_not_reachable",
+        "error-detail": { "dependency-urls": error.dependency_urls },
+      }
+    when Dependabot::GitDependencyReferenceNotFound
+      {
+        "error-type": "git_dependency_reference_not_found",
+        "error-detail": { dependency: error.dependency },
+      }
+    when Dependabot::PrivateSourceAuthenticationFailure
+      {
+        "error-type": "private_source_authentication_failure",
+        "error-detail": { source: error.source },
+      }
+    when Dependabot::PrivateSourceTimedOut
+      {
+        "error-type": "private_source_timed_out",
+        "error-detail": { source: error.source },
+      }
+    when Dependabot::PrivateSourceCertificateFailure
+      {
+        "error-type": "private_source_certificate_failure",
+        "error-detail": { source: error.source },
+      }
+    when Dependabot::MissingEnvironmentVariable
+      {
+        "error-type": "missing_environment_variable",
+        "error-detail": {
+          "environment-variable": error.environment_variable,
+        },
+      }
+    when Dependabot::GoModulePathMismatch
+      {
+        "error-type": "go_module_path_mismatch",
+        "error-detail": {
+          "declared-path": error.declared_path,
+          "discovered-path": error.discovered_path,
+          "go-mod": error.go_mod,
+        },
+      }
+    else
+      raise error
+    end
+
+  puts " => handled error whilst updating #{dependency.name}: #{error_details.fetch(:'error-type')} "\
+       "#{error_details.fetch(:'error-detail')}"
+end
+
 source = Dependabot::Source.new(
   provider: "github",
   repo: $repo_name,
@@ -315,12 +423,18 @@ source = Dependabot::Source.new(
   commit: $options[:commit]
 )
 
-$repo_contents_path = Dir.mktmpdir if $options[:clone]
+always_clone = Dependabot::Utils.
+               always_clone_for_package_manager?($package_manager)
+if $options[:clone] || always_clone
+  $repo_contents_path = Dir.mktmpdir
+  puts "=> cloning into #{$repo_contents_path}"
+end
 
 fetcher = Dependabot::FileFetchers.for_package_manager($package_manager).
           new(source: source, credentials: $options[:credentials],
               repo_contents_path: $repo_contents_path)
-$files = if $options[:clone]
+$files = if $options[:clone] || always_clone
+           fetcher.clone_repo_contents
            fetcher.files
          else
            cached_dependency_files_read do
@@ -339,10 +453,12 @@ parser = Dependabot::FileParsers.for_package_manager($package_manager).new(
 
 dependencies = cached_read("dependencies") { parser.parse }
 
-if $options[:dependency_name].nil?
+if $options[:dependency_names].nil?
   dependencies.select!(&:top_level?)
 else
-  dependencies.select! { |d| d.name == $options[:dependency_name] }
+  dependencies.select! do |d|
+    $options[:dependency_names].include?(d.name.downcase)
+  end
 end
 
 def update_checker_for(dependency)
@@ -353,7 +469,7 @@ def update_checker_for(dependency)
     repo_contents_path: $repo_contents_path,
     requirements_update_strategy: $options[:requirements_update_strategy],
     ignored_versions: ignore_conditions_for(dependency),
-    security_advisories: security_advisories_for(dependency)
+    security_advisories: security_advisories
   )
 end
 
@@ -363,23 +479,16 @@ def ignore_conditions_for(_)
   []
 end
 
-# TODO: Parse from config file
-def security_advisories_for(dependency)
-  # Array of version requirement ranges, e.g. affected_versions: ["< 3.5.1"]
-  advisories = [{
-    dependency_name: dependency.name,
-    patched_versions: [],
-    unaffected_versions: [],
-    affected_versions: []
-  }]
+def security_advisories
+  $options[:security_advisories].map do |adv|
+    vulnerable_versions = adv["affected_versions"] || []
+    safe_versions = (adv["patched_versions"] || []) +
+                    (adv["unaffected_versions"] || [])
 
-  advisories.map do |adv|
-    vulnerable_versions = adv[:affected_versions] || []
-    safe_versions = (adv[:patched_versions] || []) +
-                    (adv[:unaffected_versions] || [])
-
+    # Handle case mismatches between advisory name and parsed dependency name
+    dependency_name = adv["dependency_name"].downcase
     Dependabot::SecurityAdvisory.new(
-      dependency_name: dependency.name,
+      dependency_name: dependency_name,
       package_manager: $package_manager,
       vulnerable_versions: vulnerable_versions,
       safe_versions: safe_versions
@@ -408,7 +517,7 @@ def file_updater_for(dependencies)
     dependency_files: $files,
     repo_contents_path: $repo_contents_path,
     credentials: $options[:credentials],
-    options: $options[:updater_options],
+    options: $options[:updater_options]
   )
 end
 
@@ -428,19 +537,65 @@ def generate_dependency_files_for(updated_dependencies)
   updater.updated_dependency_files
 end
 
-puts "=> updating #{dependencies.count} dependencies"
+def security_fix?(dependency)
+  security_advisories.any? do |advisory|
+    advisory.fixed_by?(dependency)
+  end
+end
+
+puts "=> updating #{dependencies.count} dependencies: #{dependencies.map(&:name).join(", ")}"
 
 # rubocop:disable Metrics/BlockLength
+checker_count = 0
 dependencies.each do |dep|
-  puts "\n=== #{dep.name} (#{dep.version})"
+  checker_count += 1
   checker = update_checker_for(dep)
+  name_version = "\n=== #{dep.name} (#{dep.version})"
+  vulnerable = checker.vulnerable? ? " (vulnerable 🚨)" : ""
+  puts name_version + vulnerable
 
-  puts " => checking for updates"
-  puts " => latest version from registry is #{checker.latest_version}"
-  puts " => latest resolvable version is #{checker.latest_resolvable_version}"
+  puts " => checking for updates #{checker_count}/#{dependencies.count}"
+  puts " => latest available version is #{checker.latest_version}"
+
+  if $options[:security_updates_only] && !checker.vulnerable?
+    if checker.version_class.correct?(checker.dependency.version)
+      puts "    (no security update needed as it's not vulnerable)"
+    else
+      puts "    (can't update vulnerable dependencies for "\
+           "projects without a lockfile as the currently "\
+           "installed version isn't known 🚨)"
+    end
+    next
+  end
+
+  if checker.vulnerable?
+    if checker.lowest_security_fix_version
+      puts " => earliest available non-vulnerable version is "\
+           "#{checker.lowest_security_fix_version}"
+    else
+      puts " => there is no available non-vulnerable version"
+    end
+  end
+
+  latest_allowed_version = if checker.vulnerable?
+                             checker.lowest_resolvable_security_fix_version
+                           else
+                             checker.latest_resolvable_version
+                           end
+  puts " => latest allowed version is #{latest_allowed_version || dep.version}"
+
+  conflicting_dependencies = checker.conflicting_dependencies
+  if conflicting_dependencies.any?
+    puts " => The update is not possible because of the following conflicting "\
+      "dependencies:"
+
+    conflicting_dependencies.each do |conflicting_dep|
+      puts "   #{conflicting_dep['explanation']}"
+    end
+  end
 
   if checker.up_to_date?
-    puts "    (no update needed)"
+    puts "    (no update needed as it's already up-to-date)"
     next
   end
 
@@ -462,7 +617,11 @@ dependencies.each do |dep|
   end
 
   if requirements_to_unlock == :update_not_possible
-    puts "    (no update possible)"
+    if checker.vulnerable? || $options[:security_updates_only]
+      puts "    (no security update possible 🙅‍♀️)"
+    else
+      puts "    (no update possible 🙅‍♀️)"
+    end
     next
   end
 
@@ -483,6 +642,11 @@ dependencies.each do |dep|
     next true if d.requirements == d.previous_requirements
 
     d.version == d.previous_version
+  end
+
+  if $options[:security_updates_only] &&
+     updated_deps.none? { |dep| security_fix?(dep) }
+    puts "    (updated version is still vulnerable 🚨)"
   end
 
   if $options[:write]
@@ -511,6 +675,8 @@ dependencies.each do |dep|
       end
     end
   end
+rescue StandardError => e
+  handle_dependabot_error(error: e, dependency: dep)
 end
 # rubocop:enable Metrics/BlockLength
 

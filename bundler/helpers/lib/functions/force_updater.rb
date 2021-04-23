@@ -1,5 +1,7 @@
 module Functions
   class ForceUpdater
+    class TransitiveDependencyError < StandardError; end
+
     def initialize(dependency_name:, target_version:, gemfile_name:,
                    lockfile_name:, update_multiple_dependencies:)
       @dependency_name = dependency_name
@@ -17,18 +19,18 @@ module Functions
         true
       )
 
-      other_updates = []
+      dependencies_to_unlock = []
 
       begin
-        definition = build_definition(other_updates: other_updates)
+        definition = build_definition(dependencies_to_unlock: dependencies_to_unlock)
         definition.resolve_remotely!
         specs = definition.resolve
         updates = [{ name: dependency_name }] +
-          other_updates.map { |dep| { name: dep.name } }
+                  dependencies_to_unlock.map { |dep| { name: dep.name } }
         specs = specs.map do |dep|
           {
             name: dep.name,
-            version: dep.version,
+            version: dep.version
           }
         end
         [updates, specs]
@@ -39,12 +41,12 @@ module Functions
         new_dependencies_to_unlock =
           new_dependencies_to_unlock_from(
             error: e,
-            already_unlocked: other_updates
+            already_unlocked: dependencies_to_unlock
           )
 
         raise if new_dependencies_to_unlock.none?
 
-        other_updates += new_dependencies_to_unlock
+        dependencies_to_unlock += new_dependencies_to_unlock
         retry
       end
     end
@@ -54,7 +56,7 @@ module Functions
     attr_reader :dependency_name, :target_version, :gemfile_name,
                 :lockfile_name, :credentials,
                 :update_multiple_dependencies
-    alias :update_multiple_dependencies? :update_multiple_dependencies
+    alias update_multiple_dependencies? update_multiple_dependencies
 
     def new_dependencies_to_unlock_from(error:, already_unlocked:)
       potentials_deps =
@@ -96,8 +98,8 @@ module Functions
         end
     end
 
-    def build_definition(other_updates:)
-      gems_to_unlock = other_updates.map(&:name) + [dependency_name]
+    def build_definition(dependencies_to_unlock:)
+      gems_to_unlock = dependencies_to_unlock.map(&:name) + [dependency_name]
       definition = Bundler::Definition.build(
         gemfile_name,
         lockfile_name,
@@ -111,14 +113,17 @@ module Functions
         unlock_gem(definition: definition, gem_name: gem_name)
       end
 
+      dep = definition.dependencies.
+            find { |d| d.name == dependency_name }
+
+      # If the dependency is not found in the Gemfile it means this is a
+      # transitive dependency that we can't force update.
+      raise TransitiveDependencyError unless dep
+
       # Set the requirement for the gem we're forcing an update of
       new_req = Gem::Requirement.create("= #{target_version}")
-      definition.dependencies.
-        find { |d| d.name == dependency_name }.
-        tap do |dep|
-          dep.instance_variable_set(:@requirement, new_req)
-          dep.source = nil if dep.source.is_a?(Bundler::Source::Git)
-        end
+      dep.instance_variable_set(:@requirement, new_req)
+      dep.source = nil if dep.source.is_a?(Bundler::Source::Git)
 
       definition
     end
